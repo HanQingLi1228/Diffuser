@@ -2,7 +2,7 @@ export MODEL_NAME="CompVis/stable-diffusion-v1-4"
 export DATASET_NAME="lambdalabs/pokemon-blip-captions"
 
 
-accelerate launch --mixed_precision="fp16" train_text_to_image_lora.py \
+accelerate launch --mixed_precision="fp16" train_fmri_to_image_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME --caption_column="text" \
   --resolution=512 --random_flip \
