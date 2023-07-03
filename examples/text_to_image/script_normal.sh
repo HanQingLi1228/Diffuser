@@ -8,7 +8,7 @@ accelerate launch --mixed_precision="fp16"  train_text_to_image.py \
   --dataset_name=$dataset_name \
   --use_ema \
   --resolution=512 --center_crop --random_flip \
-  --train_batch_size=2 \
+  --train_batch_size=1 \
   --gradient_accumulation_steps=4 \
   --gradient_checkpointing \
   --enable_xformers_memory_efficient_attention \

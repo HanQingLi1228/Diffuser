@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # coding=utf-8
 # Copyright 2023 The HuggingFace Inc. team. All rights reserved.
 #
@@ -11,8 +12,6 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
-"""Fine-tuning script for Stable Diffusion for text2image with support for LoRA."""
 
 import argparse
 import logging
@@ -21,6 +20,7 @@ import os
 import random
 from pathlib import Path
 
+import accelerate
 import datasets
 import numpy as np
 import torch
@@ -39,12 +39,15 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
-from diffusers.loaders import AttnProcsLayers
-from diffusers.models.attention_processor import LoRAAttnProcessor
+from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.training_utils import EMAModel
+from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+
+from PIL import Image
+if is_wandb_available():
+    import wandb
 
 import sys
 sys.path.append('/home/hanqingli/diffusers/src/diffusers/dataset')
@@ -53,9 +56,11 @@ import copy
 sys.path.append('/home/hanqingli/diffusers/src/diffusers/models')
 from fMRI_mae import fmri_encoder
 sys.path.append('/home/hanqingli/diffusers/src/diffusers/pipelines/stable_diffusion')
+sys.path.append('/home/hanqingli/diffusers/examples/text_to_image')
+from custom_utils import *
+from fmri_encoder import *
 from pipeline_stable_diffusion_fmri import fMRI_StableDiffusionPipeline
 from einops import rearrange, repeat
-from PIL import Image
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -64,45 +69,10 @@ check_min_version("0.16.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+DATASET_NAME_MAPPING = {
+    "lambdalabs/pokemon-blip-captions": ("image", "text"),
+}
 
-def mkdir(path):
- 
-	folder = os.path.exists(path)
- 
-	if not folder:                   #判断是否存在文件夹如果不存在则创建为文件夹
-		os.makedirs(path)            #makedirs 创建文件时如果路径不存在会创建这个路径
-		print("---  new folder...  ---")
-		print("---  OK  ---")
- 
-	else:
-		print("---  There is this folder!  ---")
-
-def save_model_card(repo_id: str, images=None, base_model=str, dataset_name=str, repo_folder=None):
-    img_str = ""
-    for i, image in enumerate(images):
-        image.save(os.path.join(repo_folder, f"image_{i}.png"))
-        img_str += f"![img_{i}](./image_{i}.png)\n"
-
-    yaml = f"""
----
-license: creativeml-openrail-m
-base_model: {base_model}
-tags:
-- stable-diffusion
-- stable-diffusion-diffusers
-- text-to-image
-- diffusers
-- lora
-inference: true
----
-    """
-    model_card = f"""
-# LoRA text2image fine-tuning - {repo_id}
-These are LoRA adaption weights for {base_model}. The weights were fine-tuned on the {dataset_name} dataset. You can find some example images in the following. \n
-{img_str}
-"""
-    with open(os.path.join(repo_folder, "README.md"), "w") as f:
-        f.write(yaml + model_card)
 
 
 def parse_args():
@@ -157,24 +127,6 @@ def parse_args():
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
-        "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
-    )
-    parser.add_argument(
-        "--num_validation_images",
-        type=int,
-        default=4,
-        help="Number of images that should be generated during validation with `validation_prompt`.",
-    )
-    parser.add_argument(
-        "--validation_epochs",
-        type=int,
-        default=1,
-        help=(
-            "Run fine-tuning validation every X epochs. The validation process consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`."
-        ),
-    )
-    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=None,
@@ -184,9 +136,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        default=None,
+        nargs="+",
+        help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
-        default="sd-model-finetuned-lora",
+        default="sd-model-finetuned",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -265,6 +224,13 @@ def parse_args():
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=None,
+        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
+        "More details here: https://arxiv.org/abs/2303.09556.",
+    )
+    parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
@@ -273,6 +239,17 @@ def parse_args():
         help=(
             "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
             " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
+        ),
+    )
+    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
+    parser.add_argument(
+        "--non_ema_revision",
+        type=str,
+        default=None,
+        required=False,
+        help=(
+            "Revision of pretrained non-ema model identifier. Must be a branch, tag or git identifier of the local or"
+            " remote repository specified with --pretrained_model_name_or_path."
         ),
     )
     parser.add_argument(
@@ -358,6 +335,21 @@ def parse_args():
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
+    parser.add_argument(
+        "--validation_epochs",
+        type=int,
+        default=5,
+        help="Run validation every X epochs.",
+    )
+    parser.add_argument(
+        "--tracker_project_name",
+        type=str,
+        default="text2image-fine-tune",
+        help=(
+            "The `project_name` argument passed to Accelerator.init_trackers for"
+            " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
+        ),
+    )
     parser.add_argument("--filename", type=str, default="no_filename")
 
     args = parser.parse_args()
@@ -369,94 +361,31 @@ def parse_args():
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
+    # default to using the same revision for the non-ema model if not specified
+    if args.non_ema_revision is None:
+        args.non_ema_revision = args.revision
+
     return args
 
 
-DATASET_NAME_MAPPING = {
-    "lambdalabs/pokemon-blip-captions": ("image", "text"),
-}
-
-def create_fmri_cond_model(num_voxels, global_pool, config=None):
-    model = fmri_encoder(num_voxels=num_voxels, patch_size=16, embed_dim=1024,
-                depth=24, num_heads=16, mlp_ratio=1.0, global_pool=global_pool) 
-    return model
-
-class fmri_cond_model(nn.Module):
-    def __init__(self, model_dict, num_voxels, cond_dim=1280, global_pool=True, dtype=torch.float32):
-        super().__init__()
-        # prepare pretrained fmri mae 
-        model = create_fmri_cond_model(num_voxels, global_pool=global_pool, config=None)
-        model.load_checkpoint(model_dict['model'])
-        self.mae = model
-        self.fmri_seq_len = model.num_patches
-        self.fmri_latent_dim = model.embed_dim
-        if global_pool == False:
-            self.channel_mapper = nn.Sequential(
-                nn.Conv1d(self.fmri_seq_len, self.fmri_seq_len // 2, 1, bias=True),
-                nn.Conv1d(self.fmri_seq_len // 2, 77, 1, bias=True)
-            )
-        self.dim_mapper = nn.Linear(self.fmri_latent_dim, cond_dim, bias=True)
-        self.global_pool = global_pool
-        self.dtype = dtype
-
-    def forward(self, x):
-        # n, c, w = x.shape
-        # print(self.mae.blocks[0].attn.qkv.weight)
-        latent_crossattn = self.mae(x)
-        if self.global_pool == False:
-            latent_crossattn = self.channel_mapper(latent_crossattn)
-        latent_crossattn = self.dim_mapper(latent_crossattn)
-        out = latent_crossattn
-        return out
-
-unloader = transforms.ToPILImage()
-def tensor_to_PIL(tensor, transform_train):
-    #tensor = F.interpolate(tensor, scale_factor=2, mode='nearest')
-    tensor = (tensor + 1) / 2 
-    image = tensor.cpu().clone()
-    image = image.squeeze(0)
-    image = unloader(image)
-    
-    return image
-
-def save_img(ims, direction, num, filename, epoch):
-    image_path = filename+"/image/epoch_{}".format(epoch)
-    mkdir(image_path)
- 
-    if type(ims[0]) is list:
-        final = []
-        for images in ims:
-            width, height = images[0].size
-            result = Image.new(images[0].mode, (width * len(images), height))
-            for i, im in enumerate(images):
-                result.paste(im, box=(i * width, 0))
-            final.append(result)
-        final_result = Image.new(ims[0][0].mode, (width * len(ims[0]), height * len(ims)))
-        for i, im in enumerate(final):
-            final_result.paste(im, box=(0, i * height))
- 
-        # 保存图片
-        final_result.save(image_path+"/result_{}_epoch.jpg".format(epoch))
-    else:
-        width, height = ims[0].size
-        result = Image.new(ims[0].mode, (width * len(ims), height))
- 
-        # 拼接图片
-        for i, im in enumerate(ims):
-            result.paste(im, box=(i * width, 0))
- 
-        # 保存图片
-        result.save(image_path+"/test{}.jpg".format(num))
-
 def main():
     args = parse_args()
-    filename = "/home/hanqingli/diffusers/experiment/lora_fmri/" + str(args.filename)
+    filename = "/home/hanqingli/diffusers/experiment/normal_fmri/" + str(args.filename)
     mkdir(filename)
-
-
+    writer = SummaryWriter(filename+"/loss")
+    if args.non_ema_revision is not None:
+        deprecate(
+            "non_ema_revision!=None",
+            "0.15.0",
+            message=(
+                "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
+                " use `--variant=non_ema` instead."
+            ),
+        )
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -464,10 +393,6 @@ def main():
         logging_dir=logging_dir,
         project_config=accelerator_project_config,
     )
-    if args.report_to == "wandb":
-        if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-        import wandb
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -485,8 +410,6 @@ def main():
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    writer = SummaryWriter(filename+"/loss")
-
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
@@ -500,90 +423,107 @@ def main():
             repo_id = create_repo(
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
+
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    # tokenizer = CLIPTokenizer.from_pretrained(
-    #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    # )
-    # text_encoder = CLIPTextModel.from_pretrained(
-    #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
-    # )
+     
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, low_cpu_mem_usage=False
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision, low_cpu_mem_usage=False
     )
-
+    # import pdb
+    # pdb.set_trace()
     # 定义fMRI encoder
     pretrain_mbm_path = "/data/hanqingli/pretrains/GOD/fmri_encoder_just_model.pth"
     model_dict = torch.load(pretrain_mbm_path, map_location='cpu')
     fmri_encoder = fmri_cond_model(model_dict, num_voxels=4656, cond_dim=1024, global_pool=False, dtype=torch.float16)
 
-    # freeze parameters of models to save more memory
-    unet.requires_grad_(False)
+    # Freeze vae and text_encoder
     vae.requires_grad_(False)
+    fmri_encoder.requires_grad_(True)
     unet.time_embed_condition.requires_grad_(True)
 
-    #text_encoder.requires_grad_(False)
-    fmri_encoder.requires_grad_(True)
+    # # Create EMA for the unet.
+    # if args.use_ema:
+    #     ema_unet = UNet2DConditionModel.from_pretrained(
+    #         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+    #     )
+    #     ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
 
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-    # Move unet, vae and text_encoder to device and cast to weight_dtype
-    unet.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    unet.time_embed_condition.to(dtype=torch.float32)
-    #text_encoder.to(accelerator.device, dtype=weight_dtype)
-    #fmri_encoder.to(accelerator.device, dtype=weight_dtype)
+    # if args.enable_xformers_memory_efficient_attention:
+    #     if is_xformers_available():
+    #         import xformers
 
-    # now we will add new LoRA weights to the attention layers
-    # It's important to realize here how many attention weights will be added and of which sizes
-    # The sizes of the attention layers consist only of two different variables:
-    # 1) - the "hidden_size", which is increased according to `unet.config.block_out_channels`.
-    # 2) - the "cross attention size", which is set to `unet.config.cross_attention_dim`.
+    #         xformers_version = version.parse(xformers.__version__)
+    #         if xformers_version == version.parse("0.0.16"):
+    #             logger.warn(
+    #                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+    #             )
+    #         unet.enable_xformers_memory_efficient_attention()
+    #     else:
+    #         raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    # Let's first see how many attention processors we will have to set.
-    # For Stable Diffusion, it should be equal to:
-    # - down blocks (2x attention layers) * (2x transformer layers) * (3x down blocks) = 12
-    # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
-    # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
-    # => 32 layers
+    # def compute_snr(timesteps):
+    #     """
+    #     Computes SNR as per https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L847-L849
+    #     """
+    #     alphas_cumprod = noise_scheduler.alphas_cumprod
+    #     sqrt_alphas_cumprod = alphas_cumprod**0.5
+    #     sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
 
-    # Set correct lora layers
-    lora_attn_procs = {}
-    for name in unet.attn_processors.keys():
-        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks.")])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks.")])
-            hidden_size = unet.config.block_out_channels[block_id]
+    #     # Expand the tensors.
+    #     # Adapted from https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/521b624bd70c67cee4bdf49225915f5945a872e3/guided_diffusion/gaussian_diffusion.py#L1026
+    #     sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    #     while len(sqrt_alphas_cumprod.shape) < len(timesteps.shape):
+    #         sqrt_alphas_cumprod = sqrt_alphas_cumprod[..., None]
+    #     alpha = sqrt_alphas_cumprod.expand(timesteps.shape)
 
-        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+    #     sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    #     while len(sqrt_one_minus_alphas_cumprod.shape) < len(timesteps.shape):
+    #         sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod[..., None]
+    #     sigma = sqrt_one_minus_alphas_cumprod.expand(timesteps.shape)
 
-    unet.set_attn_processor(lora_attn_procs)
+    #     # Compute SNR.
+    #     snr = (alpha / sigma) ** 2
+    #     return snr
 
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
+    # `accelerate` 0.16.0 will have better support for customized saving
+    if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
+        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        def save_model_hook(models, weights, output_dir):
+            if args.use_ema:
+                ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+            for i, model in enumerate(models):
+                model.save_pretrained(os.path.join(output_dir, "unet"))
 
-    lora_layers = AttnProcsLayers(unet.attn_processors)
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+        def load_model_hook(models, input_dir):
+            if args.use_ema:
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
+                ema_unet.load_state_dict(load_model.state_dict())
+                ema_unet.to(accelerator.device)
+                del load_model
+
+            for i in range(len(models)):
+                # pop models so that they are not loaded again
+                model = models.pop()
+
+                # load diffusers style into model
+                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                model.register_to_config(**load_model.config)
+
+                model.load_state_dict(load_model.state_dict())
+                del load_model
+
+        accelerator.register_save_state_pre_hook(save_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
+
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
@@ -606,8 +546,7 @@ def main():
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-    parameters = list(lora_layers.parameters()) + list(fmri_encoder.parameters()) + list(unet.time_embed_condition.parameters())
-    #parameters = list(lora_layers.parameters()) + list(fmri_encoder.parameters())
+    parameters = list(unet.parameters()) + list(fmri_encoder.parameters())
     optimizer = optimizer_cls(
         parameters,
         lr=args.learning_rate,
@@ -616,36 +555,8 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+    #############
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    # if args.dataset_name is not None:
-    #     # Downloading and loading a dataset from the hub.
-    #     dataset = load_dataset(
-    #         args.dataset_name,
-    #         args.dataset_config_name,
-    #         cache_dir=args.cache_dir,
-    #     )
-    # else:
-    #     data_files = {}
-    #     if args.train_data_dir is not None:
-    #         data_files["train"] = os.path.join(args.train_data_dir, "**")
-    #     dataset = load_dataset(
-    #         "imagefolder",
-    #         data_files=data_files,
-    #         cache_dir=args.cache_dir,
-    #     )
-    #     # See more about loading custom images at
-    #     # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # # Preprocessing the datasets.
-    # # We need to tokenize inputs and targets.
-    # column_names = dataset["train"].column_names
-
-    #########
-    
     def fmri_transform(x, sparse_rate=0.2):
     # x: 1, num_voxels
         x_aug = copy.deepcopy(x)
@@ -655,11 +566,11 @@ def main():
 
     def normalize(img):
         if img.shape[-1] == 3:
-           img = rearrange(img, 'h w c -> c h w')
+            img = rearrange(img, 'h w c -> c h w')
         img = torch.tensor(img)
         img = img * 2.0 - 1.0 # to -1 ~ 1
         return img
-
+    
     class random_crop:
         def __init__(self, size, p):
             self.size = size
@@ -687,16 +598,15 @@ def main():
         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
     ])
 
-
     fmri_latents_dataset_train, fmri_latents_dataset_test = create_Kamitani_dataset('/home/hanqingli/diffusers/data/Kamitani/npz', 'VC', 16, 
             fmri_transform=fmri_transform, image_transform=[img_transform_train, img_transform_test], 
             subjects=['sbj_3'])
     num_voxels = fmri_latents_dataset_train.num_voxels
     train_dataloader = torch.utils.data.DataLoader(fmri_latents_dataset_train, batch_size=5, shuffle=True, num_workers=args.dataloader_num_workers)
     test_dataloader = torch.utils.data.DataLoader(fmri_latents_dataset_test, batch_size=len(fmri_latents_dataset_test), shuffle=False, num_workers=args.dataloader_num_workers)
-    # train_dataloader = accelerator.prepare(train_dataloader)
-    # test_dataloader = train_dataloader
-    ###########
+
+    #############
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -710,16 +620,28 @@ def main():
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
-    
+
     # Prepare everything with our `accelerator`.
-    lora_layers, optimizer, train_dataloader, lr_scheduler, fmri_encoder, test_dataloader, unet.time_embed_condition = accelerator.prepare(
-        lora_layers, optimizer, train_dataloader, lr_scheduler, fmri_encoder, test_dataloader, unet.time_embed_condition
+    unet, optimizer, train_dataloader, lr_scheduler, fmri_encoder, test_dataloader = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler, fmri_encoder, test_dataloader
     )
-    # lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-    #     lora_layers, optimizer, train_dataloader, lr_scheduler
-    # )
+
+    if args.use_ema:
+        ema_unet.to(accelerator.device)
+
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move text_encode and vae to gpu and cast to weight_dtype
+    vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -728,7 +650,9 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("fmri2image-fine-tune", config=vars(args))
+        tracker_config = dict(vars(args))
+        tracker_config.pop("validation_prompts")
+        accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -771,12 +695,12 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-    
+
     ssss = 0
     for epoch in range(first_epoch, args.num_train_epochs):
-        # torch.save(vae.state_dict(), "/data/hanqingli/diffusers/origin/lora_vae.pth")
-        # torch.save(unet.state_dict(), "/data/hanqingli/diffusers/origin/lora_unet.pth")
-        # torch.save(fmri_encoder.state_dict(), "/data/hanqingli/diffusers/origin/lora_fmri_encoder.pth")
+        # torch.save(vae.state_dict(), "/data/hanqingli/diffusers/origin/vae.pth")
+        # torch.save(unet.state_dict(), "/data/hanqingli/diffusers/origin/unet.pth")
+        # torch.save(fmri_encoder.state_dict(), "/data/hanqingli/diffusers/origin/fmri_encoder.pth")
         unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
@@ -789,7 +713,7 @@ def main():
 
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                latents = vae.encode(batch["image"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(batch["image"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -822,7 +746,23 @@ def main():
 
                 # Predict the noise residual and compute loss
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                if args.snr_gamma is None:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(timesteps)
+                    mse_loss_weights = (
+                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                    )
+                    # We first calculate the original loss. Then we mean over the non-batch dimensions and
+                    # rebalance the sample-wise losses with their respective loss weights.
+                    # Finally, we take the mean of the rebalanced loss.
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -831,64 +771,67 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    # import pdb
-                    # pdb.set_trace()
-                    params_to_clip = lora_layers.parameters()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(parameters, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
+                if args.use_ema:
+                    ema_unet.step(unet.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 writer.add_scalar("train_loss", train_loss, ssss)
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-            writer.add_scalar("step_loss", loss, ssss)
+
+                # if global_step % args.checkpointing_steps == 0:
+                #     if accelerator.is_main_process:
+                #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                #         accelerator.save_state(save_path)
+                #         logger.info(f"Saved state to {save_path}")
+
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            writer.add_scalar("step_loss", loss, ssss)
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
-                break
-        # torch.save(vae.state_dict(), "/data/hanqingli/diffusers/after/lora_vae.pth")
-        # torch.save(unet.state_dict(), "/data/hanqingli/diffusers/after/lora_unet.pth")
-        # torch.save(fmri_encoder.state_dict(), "/data/hanqingli/diffusers/after/lora_fmri_encoder.pth")
+                break 
+        # torch.save(vae.state_dict(), "/data/hanqingli/diffusers/after/vae.pth")
+        # torch.save(unet.state_dict(), "/data/hanqingli/diffusers/after/unet.pth")
+        # torch.save(fmri_encoder.state_dict(), "/data/hanqingli/diffusers/after/fmri_encoder.pth")
         # import pdb
-        # pdb.set_trace()
+        # pdb.set_trace() 
         if accelerator.is_main_process:
-            if epoch % args.validation_epochs == 0:
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                )
-                # create pipeline
+            if  epoch % args.validation_epochs == 0:
+                if args.use_ema:
+                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    ema_unet.store(unet.parameters())
+                    ema_unet.copy_to(unet.parameters())
+                logger.info("Running validation... ")
                 pipeline = fMRI_StableDiffusionPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
+                    vae=vae,
+                    text_encoder=fmri_encoder,
                     unet=accelerator.unwrap_model(unet),
-                    text_encoder = fmri_encoder,
                     revision=args.revision,
                     torch_dtype=weight_dtype,
+                    safety_checker=None
                 )
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
-
-                # run inference
-                bb = 0
-                generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                if args.enable_xformers_memory_efficient_attention:
+                    pipeline.enable_xformers_memory_efficient_attention()
+                if args.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
                 if epoch % 10 == 0:
                     print("run full validation")
                     all_images = []
                     for step, batch in enumerate(test_dataloader):
                         #batch_f = batch['fmri'].reshape(batch['fmri'].shape[0], batch['fmri'].shape[-1])
-                        bb += 1
-                        if bb > 4:
-                            break
                         cc = 0
                         for gt, data in zip(batch['image'], batch['fmri']):
                             cc += 1
@@ -910,9 +853,6 @@ def main():
                     all_images = []
                     for step, batch in enumerate(test_dataloader):
                         #batch_f = batch['fmri'].reshape(batch['fmri'].shape[0], batch['fmri'].shape[-1])
-                        bb += 1
-                        if bb > 10:
-                            break
                         cc = 0
                         for gt, data in zip(batch['image'], batch['fmri']):
                             cc += 1
@@ -924,82 +864,64 @@ def main():
                             gt = tensor_to_PIL(gt, img_transform_train)
                             images.append(gt)
                             data = repeat(data, 'h w -> b h w', b=1)
-                            for _ in range(5):
+                            for _ in range(1):
                                 images.append(
                                     pipeline(data, num_inference_steps=250, generator=generator, guidance_scale = 1).images[0]
                                 )
                             save_img(images, direction="c", num=cc, epoch=epoch, filename=filename)
                             all_images.append(images)
                     save_img(all_images, direction="c", num=epoch, epoch=epoch, filename=filename)
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "validation": [
-                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
+                # for tracker in accelerator.trackers:
+                #     if tracker.name == "tensorboard":
+                #         np_images = np.stack([np.asarray(img) for img in images])
+                #         tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+                #     elif tracker.name == "wandb":
+                #         tracker.log(
+                #             {
+                #                 "validation": [
+                #                     wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
+                #                     for i, image in enumerate(images)
+                #                 ]
+                #             }
+                #         )
+                #     else:
+                #         logger.warn(f"image logging not implemented for {tracker.name}")
 
                 del pipeline
                 torch.cuda.empty_cache()
 
-    # # Save the lora layers
+                if args.use_ema:
+                    # Switch back to the original UNet parameters.
+                    ema_unet.restore(unet.parameters())
+        # torch.save(vae.state_dict(), "/data/hanqingli/diffusers/after/vae.pth")
+        # torch.save(unet.state_dict(), "/data/hanqingli/diffusers/after/unet.pth")
+        # torch.save(fmri_encoder.state_dict(), "/data/hanqingli/diffusers/after/fmri_encoder.pth")
+        # import pdb
+        # pdb.set_trace()
+
+    # Create the pipeline using the trained modules and save it.
     # accelerator.wait_for_everyone()
     # if accelerator.is_main_process:
-    #     unet = unet.to(torch.float32)
-    #     unet.save_attn_procs(args.output_dir)
+    #     unet = accelerator.unwrap_model(unet)
+    #     if args.use_ema:
+    #         ema_unet.copy_to(unet.parameters())
+
+    #     pipeline = fMRI_StableDiffusionPipeline.from_pretrained(
+    #         args.pretrained_model_name_or_path,
+    #         text_encoder=fmri_encoder,
+    #         vae=vae,
+    #         unet=unet,
+    #         revision=args.revision,
+    #     )
+    #     pipeline.save_pretrained(args.output_dir)
 
     #     if args.push_to_hub:
-    #         save_model_card(
-    #             repo_id,
-    #             images=images,
-    #             base_model=args.pretrained_model_name_or_path,
-    #             dataset_name=args.dataset_name,
-    #             repo_folder=args.output_dir,
-    #         )
     #         upload_folder(
     #             repo_id=repo_id,
     #             folder_path=args.output_dir,
     #             commit_message="End of training",
     #             ignore_patterns=["step_*", "epoch_*"],
     #         )
-
-    # # Final inference
-    # # Load previous pipeline
-    # pipeline = DiffusionPipeline.from_pretrained(
-    #     args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=weight_dtype
-    # )
-
-    # pipeline = pipeline.to(accelerator.device)
-
-    # # load attention processors
-    # pipeline.unet.load_attn_procs(args.output_dir)
-
-    # # run inference
-    # generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-    # images = []
-    # for _ in range(args.num_validation_images):
-    #     images.append(pipeline(args.validation_prompt, num_inference_steps=30, generator=generator).images[0])
-
-    # if accelerator.is_main_process:
-    #     for tracker in accelerator.trackers:
-    #         if tracker.name == "tensorboard":
-    #             np_images = np.stack([np.asarray(img) for img in images])
-    #             tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
-    #         if tracker.name == "wandb":
-    #             tracker.log(
-    #                 {
-    #                     "test": [
-    #                         wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-    #                         for i, image in enumerate(images)
-    #                     ]
-    #                 }
-    #             )
 
     accelerator.end_training()
 

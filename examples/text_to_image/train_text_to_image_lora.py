@@ -441,7 +441,6 @@ def main():
     # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
     # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
     # => 32 layers
-
     # Set correct lora layers
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
@@ -776,7 +775,6 @@ def main():
                 )
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
-
                 # run inference
                 generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
                 images = []

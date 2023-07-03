@@ -848,8 +848,8 @@ def main():
 
                 # Backpropagate
                 accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                #if accelerator.sync_gradients:
+                    #accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -901,7 +901,6 @@ def main():
         unet = accelerator.unwrap_model(unet)
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
-
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             text_encoder=text_encoder,
